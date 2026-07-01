@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "charleneleong84@gmail.com": "charleneleong-ai",  # PR #11736 salvage (classify Anthropic "out of extra usage" 400 as billing)
     "janrenz@Mac.fritz.box": "janrenz",  # PR #35862 salvage (prompt_caching.enabled escape hatch for strict providers)
     "syahidfrd@gmail.com": "syahidfrd",  # PR #17059 salvage (tag unverified senders in Slack thread context to mitigate indirect prompt injection)
     "5823452+sgabel@users.noreply.github.com": "sgabel",  # PR #13139 salvage (redact secrets in user-facing approval prompts)
