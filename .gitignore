@@ -93,6 +93,10 @@ apps/shared/src/**/*.js
 apps/shared/src/**/*.js.map
 apps/shared/src/**/*.d.ts
 apps/desktop/release/
+apps/desktop/release-atlas-refined/
+apps/desktop/release-luminous/
+apps/desktop/verification/
+apps/desktop/live-*.png
 *.tsbuildinfo
 
 # Web UI assets — synced from @nous-research/ui at build time via
@@ -166,6 +170,7 @@ scripts/out/
 # stores the published notes. They are not a build artifact and must never be
 # committed to the repo root. See the hermes-release skill.
 RELEASE_v*.md
+.tmp-pr-body.md
 
 # Desktop demo-run scratch output (hermes writes demo/*.txt during recorded
 # walkthroughs). Throwaway artifacts, never part of the app.

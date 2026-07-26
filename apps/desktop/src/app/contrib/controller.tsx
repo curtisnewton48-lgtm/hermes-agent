@@ -71,6 +71,8 @@ import { $workspaceIsPage } from '../routes'
 import { FilesPane, LogsPane, PreviewRailPane, ReviewPaneContent } from './panes'
 import { ContribWiring, WiredPane } from './wiring'
 
+const SESSIONS_PANE_WIDTH = `var(--atlas-sidebar-pane-width, ${SIDEBAR_DEFAULT_WIDTH}px)`
+
 /**
  * Stripped-down app root (bb/contrib-areas) on the layout TREE model, mounting
  * the REAL app surfaces. The title bar and status bar sit OUTSIDE the grid
@@ -143,7 +145,7 @@ registry.registerMany([
       collapsible: true,
       dock: { pane: 'workspace', pos: 'left' },
       revealAliases: ['chat-sidebar'],
-      width: `${SIDEBAR_DEFAULT_WIDTH}px`,
+      width: SESSIONS_PANE_WIDTH,
       minWidth: `${SIDEBAR_DEFAULT_WIDTH}px`,
       maxWidth: `${SIDEBAR_MAX_WIDTH}px`
     },
