@@ -166,6 +166,8 @@ export function Intro({ personality, seed }: IntroProps) {
     >
       <div className="w-full min-w-0">
         <div aria-hidden="true" className="hermes-intro-medallion">
+          <span className="hermes-intro-orbit hermes-intro-orbit--one" />
+          <span className="hermes-intro-orbit hermes-intro-orbit--two" />
           <img alt="" src={`${import.meta.env.BASE_URL}nous-girl.jpg`} />
         </div>
         <p
@@ -183,7 +185,10 @@ export function Intro({ personality, seed }: IntroProps) {
           <span />
         </div>
         <p className="m-0 text-center leading-normal tracking-tight">{copy.body}</p>
-        <div className="hermes-intro-ready-pill">Ready when you are</div>
+        <div className="hermes-intro-ready-pill">
+          <span>Ready when you are</span>
+          <span aria-hidden="true">-&gt;</span>
+        </div>
       </div>
     </div>
   )

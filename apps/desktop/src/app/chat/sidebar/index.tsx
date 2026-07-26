@@ -62,7 +62,14 @@ import {
   toggleSidebarMessagingOpen,
   unpinSession
 } from '@/store/layout'
-import { $newChatProfile, $profiles, $profileScope, ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $newChatProfile,
+  $profiles,
+  $profileScope,
+  ALL_PROFILES,
+  normalizeProfileKey
+} from '@/store/profile'
 import {
   $activeProjectId,
   $projects,
@@ -97,9 +104,11 @@ import {
   setCurrentCwd
 } from '@/store/session'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
+import { useTheme } from '@/themes'
 
 import {
   type AppView,
+  AGENTS_ROUTE,
   ARTIFACTS_ROUTE,
   MESSAGING_ROUTE,
   SIDEBAR_NAV_AREA,
@@ -131,6 +140,7 @@ import {
   useRepoWorktreeMap
 } from './projects'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
+import { atlasAgentsFromProfiles, type AtlasAgentSummary } from './atlas-agents'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
@@ -255,6 +265,7 @@ export function ChatSidebar({
   onTriggerCronJob
 }: ChatSidebarProps) {
   const { t } = useI18n()
+  const { themeName } = useTheme()
   const s = t.sidebar
   const { pathname } = useLocation()
   // Contributed nav rows (plugins pairing a page with a sidebar entry) render
@@ -304,6 +315,7 @@ export function ChatSidebar({
   const sessionProfileTotals = useStore($sessionProfileTotals)
   const workingSessionIds = useStore($workingSessionIds)
   const profiles = useStore($profiles)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const profileScope = useStore($profileScope)
   // Only surface the profile switcher when more than one profile exists, so
   // single-profile users see the unchanged sidebar.
@@ -371,6 +383,19 @@ export function ChatSidebar({
   }, [])
 
   const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
+  const atlasAgents = useMemo(
+    () => atlasAgentsFromProfiles(profiles, activeGatewayProfile),
+    [activeGatewayProfile, profiles]
+  )
+  const agentsNavItem = useMemo<SidebarNavItem>(
+    () => ({
+      id: 'agents',
+      label: 'Agents',
+      icon: props => <Codicon name="sparkle" {...props} />,
+      route: AGENTS_ROUTE
+    }),
+    []
+  )
 
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -1489,6 +1514,10 @@ export function ChatSidebar({
 
         {!showSessionSections && <SidebarBlankState onNewProject={openProjectCreate} />}
 
+        {themeName === 'atlas' && atlasAgents.length > 0 && (
+          <AtlasAgentsCard agents={atlasAgents} onOpen={() => onNavigate(agentsNavItem)} />
+        )}
+
         <div className="shrink-0 px-0.5 pb-1 pt-0.5">
           <ProfileRail />
         </div>
@@ -1504,4 +1533,37 @@ interface MessagingSection {
   sessions: SessionInfo[]
   total: number
   hasMore: boolean
+}
+
+function AtlasAgentsCard({ agents, onOpen }: { agents: readonly AtlasAgentSummary[]; onOpen: () => void }) {
+  return (
+    <section className="atlas-agents-card mx-0.5 mb-1.5 mt-1 shrink-0" aria-label="Agents">
+      <div className="atlas-agents-header">
+        <span>AGENTS</span>
+        <Button aria-label="Open agents" className="atlas-agents-open" onClick={onOpen} size="icon-xs" variant="ghost">
+          <Codicon name="add" size="0.75rem" />
+        </Button>
+      </div>
+      <div className="atlas-agents-list">
+        {agents.map(agent => (
+          <button className="atlas-agent-row" key={agent.name} onClick={onOpen} type="button">
+            <span className="atlas-agent-avatar" style={{ '--atlas-agent-accent': agent.accent } as React.CSSProperties}>
+              {agent.initials}
+            </span>
+            <span className="atlas-agent-copy">
+              <span className="atlas-agent-name">{agent.name}</span>
+              <span className="atlas-agent-detail">{agent.detail}</span>
+            </span>
+            <span className="atlas-agent-status" data-active={agent.status === 'Active' ? '' : undefined}>
+              {agent.status}
+            </span>
+          </button>
+        ))}
+      </div>
+      <Button className="atlas-agents-view" onClick={onOpen} size="sm" type="button" variant="ghost">
+        <span>View all agents</span>
+        <Codicon name="arrow-right" size="0.75rem" />
+      </Button>
+    </section>
+  )
 }
