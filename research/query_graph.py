@@ -3,26 +3,32 @@
 Query Graph v1 is a research-planning layer above Evidence Fabric. Evidence
 Fabric remains authoritative for ResearchRun lifecycle and claim state; this
 module owns question/graph structure, deterministic normalization, and scoped
-read decoding. Mutation behavior is added incrementally by the implementation
-plan and must preserve the same runtime-owned scope boundary.
+read/write behavior. Models may propose research structure, but durable state
+is committed only through deterministic runtime/database invariants here.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import unicodedata
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from research.evidence_fabric import ClaimStatus, EvidenceScope
+
+if TYPE_CHECKING:
+    from hermes_state import SessionDB
 
 MAX_IDENTIFIER_CHARS = 200
 MAX_QUESTION_TEXT_CHARS = 16_384
 MAX_EVENT_PAYLOAD_CHARS = 16_384
+MAX_EVENT_REASON_CHARS = 2_048
 
 
 class GraphRole(StrEnum):
@@ -225,6 +231,21 @@ def _id(value: str) -> str:
     return value
 
 
+def _required_text(value: str, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise QueryGraphValidationError(f"{field} is required")
+    return value.strip()
+
+
+def _reason(value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise QueryGraphValidationError("reason is required")
+    cleaned = value.strip()
+    if len(cleaned) > MAX_EVENT_REASON_CHARS:
+        raise QueryGraphValidationError("reason is too long")
+    return cleaned
+
+
 def _dt(value: float | int | None) -> datetime | None:
     if value is None:
         return None
@@ -236,6 +257,10 @@ def _required_dt(value: float | int | None) -> datetime:
     if decoded is None:
         raise QueryGraphIntegrityError("required timestamp is missing")
     return decoded
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def normalize_question_text(text: str) -> str:
@@ -255,6 +280,22 @@ def question_fingerprint(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _encode_payload(payload: Mapping[str, Any] | None) -> str:
+    if payload is None:
+        return "{}"
+    if not isinstance(payload, Mapping):
+        raise QueryGraphValidationError("event payload must be an object")
+    try:
+        encoded = json.dumps(
+            dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+    except (TypeError, ValueError) as exc:
+        raise QueryGraphValidationError("event payload is not JSON serializable") from exc
+    if len(encoded) > MAX_EVENT_PAYLOAD_CHARS:
+        raise QueryGraphValidationError("event payload is too large")
+    return encoded
+
+
 def _decode_payload(raw: str | None) -> Mapping[str, Any]:
     if raw is None:
         return MappingProxyType({})
@@ -270,9 +311,12 @@ def _decode_payload(raw: str | None) -> Mapping[str, Any]:
 
 
 class QueryGraphService:
-    def __init__(self, db: "SessionDB", scope: EvidenceScope) -> None:
+    def __init__(self, db: SessionDB, scope: EvidenceScope) -> None:
         self.db = db
         self.scope = scope
+
+    def _write(self, fn):
+        return self.db._execute_write(fn)
 
     def _fetch(self, sql: str, params: tuple[Any, ...] = ()):
         with self.db._lock:
@@ -287,6 +331,68 @@ class QueryGraphService:
         if row["owner_scope_key"] != self.scope.scope_key:
             raise QueryGraphScopeError("research run belongs to another scope")
         return row
+
+    def _run_in_cursor(self, cursor, run_id: str, *, require_open: bool = False):
+        run_id = _id(run_id)
+        row = cursor.execute(
+            "SELECT * FROM research_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise QueryGraphNotFoundError("research run not found")
+        if row["owner_scope_key"] != self.scope.scope_key:
+            raise QueryGraphScopeError("research run belongs to another scope")
+        if require_open and row["status"] != "OPEN":
+            raise QueryGraphLifecycleError("terminal research run is immutable")
+        return row
+
+    def _graph_row_in_cursor(self, cursor, graph_id: str):
+        graph_id = _id(graph_id)
+        row = cursor.execute(
+            "SELECT * FROM query_graphs WHERE id=?", (graph_id,)
+        ).fetchone()
+        if row is None:
+            raise QueryGraphNotFoundError("query graph not found")
+        self._run_in_cursor(cursor, row["research_run_id"], require_open=True)
+        return row
+
+    def _append_event(
+        self,
+        cursor,
+        *,
+        run_id: str,
+        event_type: str,
+        graph_id: str | None = None,
+        question_id: str | None = None,
+        reason: str | None = None,
+        payload: Mapping[str, Any] | None = None,
+        created_at: datetime | None = None,
+    ) -> None:
+        event_type = _required_text(event_type, field="event type")
+        if len(event_type) > 100:
+            raise QueryGraphValidationError("event type is too long")
+        if graph_id is not None:
+            graph_id = _id(graph_id)
+        if question_id is not None:
+            question_id = _id(question_id)
+        clean_reason = None if reason is None else _reason(reason)
+        now = created_at or _now()
+        cursor.execute(
+            "INSERT INTO query_graph_events "
+            "(research_run_id, graph_id, question_id, event_type, actor_agent, "
+            "actor_profile, reason, payload_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _id(run_id),
+                graph_id,
+                question_id,
+                event_type,
+                self.scope.agent_id,
+                self.scope.profile_name,
+                clean_reason,
+                _encode_payload(payload),
+                now.timestamp(),
+            ),
+        )
 
     @staticmethod
     def _graph_dto(row) -> QueryGraph:
@@ -347,6 +453,115 @@ class QueryGraphService:
             payload=_decode_payload(row["payload_json"]),
             created_at=_required_dt(row["created_at"]),
         )
+
+    def create_graph(
+        self,
+        run_id: str,
+        *,
+        name: str,
+        purpose: str,
+        role: GraphRole = GraphRole.OPTIONAL,
+        reason: GraphCreationReason = GraphCreationReason.ROOT,
+    ) -> QueryGraph:
+        run_id = _id(run_id)
+        name = _required_text(name, field="graph name")
+        purpose = _required_text(purpose, field="graph purpose")
+        try:
+            role = GraphRole(role)
+            creation_reason = GraphCreationReason(reason)
+        except ValueError as exc:
+            raise QueryGraphValidationError("invalid graph role or creation reason") from exc
+        graph_id = str(uuid.uuid4())
+        now = _now()
+
+        def write(cursor):
+            self._run_in_cursor(cursor, run_id, require_open=True)
+            cursor.execute(
+                "INSERT INTO query_graphs "
+                "(id, research_run_id, name, purpose, role, workflow_state, "
+                "created_by_agent, created_by_profile, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)",
+                (
+                    graph_id,
+                    run_id,
+                    name,
+                    purpose,
+                    role.value,
+                    self.scope.agent_id,
+                    self.scope.profile_name,
+                    now.timestamp(),
+                    now.timestamp(),
+                ),
+            )
+            self._append_event(
+                cursor,
+                run_id=run_id,
+                graph_id=graph_id,
+                event_type="GRAPH_CREATED",
+                reason=creation_reason.value,
+                payload={"name": name, "purpose": purpose, "role": role.value},
+                created_at=now,
+            )
+
+        try:
+            self._write(write)
+        except sqlite3.IntegrityError as exc:
+            if str(exc) in {
+                "research run is not open",
+                "terminal research run is immutable",
+            }:
+                raise QueryGraphLifecycleError(str(exc)) from exc
+            raise QueryGraphIntegrityError(str(exc)) from exc
+        return self.get_graph(graph_id)
+
+    def set_graph_role(
+        self,
+        graph_id: str,
+        role: GraphRole,
+        *,
+        reason: str,
+    ) -> QueryGraph:
+        graph_id = _id(graph_id)
+        clean_reason = _reason(reason)
+        try:
+            role = GraphRole(role)
+        except ValueError as exc:
+            raise QueryGraphValidationError("invalid graph role") from exc
+        now = _now()
+
+        def write(cursor):
+            row = self._graph_row_in_cursor(cursor, graph_id)
+            if row["workflow_state"] == GraphWorkflowState.CLOSED.value:
+                raise QueryGraphLifecycleError("closed query graph role is immutable")
+            if row["role"] == role.value:
+                raise QueryGraphLifecycleError(
+                    f"graph role is already {role.value}"
+                )
+            old_role = row["role"]
+            cursor.execute(
+                "UPDATE query_graphs SET role=?,updated_at=? WHERE id=?",
+                (role.value, now.timestamp(), graph_id),
+            )
+            self._append_event(
+                cursor,
+                run_id=row["research_run_id"],
+                graph_id=graph_id,
+                event_type="GRAPH_ROLE_CHANGED",
+                reason=clean_reason,
+                payload={"old_role": old_role, "new_role": role.value},
+                created_at=now,
+            )
+
+        try:
+            self._write(write)
+        except sqlite3.IntegrityError as exc:
+            if str(exc) in {
+                "research run is not open",
+                "terminal research run is immutable",
+            }:
+                raise QueryGraphLifecycleError(str(exc)) from exc
+            raise QueryGraphIntegrityError(str(exc)) from exc
+        return self.get_graph(graph_id)
 
     def get_graph(self, graph_id: str) -> QueryGraph:
         graph_id = _id(graph_id)
@@ -412,9 +627,3 @@ class QueryGraphService:
         return tuple(
             self._event_dto(row) for row in self._fetch(sql, tuple(params))
         )
-
-
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from hermes_state import SessionDB
