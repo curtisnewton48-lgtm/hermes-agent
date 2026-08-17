@@ -81,6 +81,7 @@ def _create_pre_query_graph_v27_database(db_path):
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
                 source TEXT NOT NULL,
+                parent_session_id TEXT,
                 started_at REAL NOT NULL
             );
 
