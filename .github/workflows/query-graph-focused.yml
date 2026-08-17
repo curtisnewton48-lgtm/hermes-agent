@@ -48,8 +48,7 @@ jobs:
         run: |
           source .venv/bin/activate
           python -m pytest \
-            tests/test_query_graph.py \
-            tests/test_query_graph_schema.py \
+            tests/test_query_graph*.py \
             tests/test_evidence_fabric.py \
             tests/test_evidence_fabric_schema.py -q
         env:
