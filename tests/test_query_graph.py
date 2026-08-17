@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import timezone
+from datetime import datetime, timezone
 
 import pytest
 
@@ -236,6 +236,7 @@ def test_foreign_scope_cannot_read_graph_question_or_events(tmp_path):
 def test_public_dataclass_contracts_are_constructible_and_frozen():
     # These types are consumed by later tasks; this test catches accidental
     # renames or mutability before write-path behavior is implemented.
+    service_time = datetime.fromtimestamp(1, timezone.utc)
     question = ResearchQuestion(
         id="q",
         graph_id="g",
@@ -249,9 +250,7 @@ def test_public_dataclass_contracts_are_constructible_and_frozen():
         closed_resolution=None,
         created_by_agent="agent",
         created_by_profile=None,
-        created_at=service_time := __import__("datetime").datetime.fromtimestamp(
-            1, timezone.utc
-        ),
+        created_at=service_time,
         updated_at=service_time,
         closed_at=None,
         closed_by_agent=None,
