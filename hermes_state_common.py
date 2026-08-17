@@ -216,7 +216,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -493,6 +493,116 @@ CREATE TABLE IF NOT EXISTS claim_evidence_links (
         REFERENCES evidence_records(id, research_run_id)
 );
 
+CREATE TABLE IF NOT EXISTS query_graphs (
+    id TEXT PRIMARY KEY,
+    research_run_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'OPTIONAL'
+        CHECK (role IN ('REQUIRED', 'OPTIONAL')),
+    workflow_state TEXT NOT NULL DEFAULT 'OPEN'
+        CHECK (workflow_state IN ('OPEN', 'CLOSED')),
+    created_by_agent TEXT NOT NULL,
+    created_by_profile TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    closed_at REAL,
+    closed_by_agent TEXT,
+    closed_by_profile TEXT,
+    UNIQUE (id, research_run_id),
+    FOREIGN KEY (research_run_id) REFERENCES research_runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS research_questions (
+    id TEXT PRIMARY KEY,
+    graph_id TEXT NOT NULL,
+    research_run_id TEXT NOT NULL,
+    question_text TEXT NOT NULL,
+    normalized_fingerprint TEXT NOT NULL CHECK (length(normalized_fingerprint) = 64),
+    role TEXT NOT NULL DEFAULT 'OPTIONAL'
+        CHECK (role IN ('REQUIRED', 'OPTIONAL')),
+    workflow_state TEXT NOT NULL DEFAULT 'OPEN'
+        CHECK (workflow_state IN ('OPEN', 'IN_PROGRESS', 'BLOCKED', 'CLOSED')),
+    creation_reason TEXT NOT NULL
+        CHECK (creation_reason IN ('ROOT', 'EVIDENCE_GAP', 'CONTRADICTION', 'DEPENDENCY', 'SCOPE_REFINEMENT', 'OTHER')),
+    blocked_reason TEXT,
+    closed_resolution TEXT
+        CHECK (closed_resolution IS NULL OR closed_resolution IN ('UNANSWERED', 'PARTIALLY_ANSWERED', 'SUPPORTED', 'CONTESTED')),
+    created_by_agent TEXT NOT NULL,
+    created_by_profile TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    closed_at REAL,
+    closed_by_agent TEXT,
+    closed_by_profile TEXT,
+    UNIQUE (id, research_run_id),
+    FOREIGN KEY (graph_id, research_run_id)
+        REFERENCES query_graphs(id, research_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS question_dependencies (
+    dependent_question_id TEXT NOT NULL,
+    prerequisite_question_id TEXT NOT NULL,
+    research_run_id TEXT NOT NULL,
+    acceptance_policy TEXT NOT NULL DEFAULT 'SUPPORTED'
+        CHECK (acceptance_policy IN ('SUPPORTED', 'PARTIAL_OR_BETTER', 'ANY_CLOSED')),
+    created_by_agent TEXT NOT NULL,
+    created_by_profile TEXT,
+    created_at REAL NOT NULL,
+    CHECK (dependent_question_id <> prerequisite_question_id),
+    FOREIGN KEY (dependent_question_id, research_run_id)
+        REFERENCES research_questions(id, research_run_id),
+    FOREIGN KEY (prerequisite_question_id, research_run_id)
+        REFERENCES research_questions(id, research_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS question_claim_links (
+    question_id TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    research_run_id TEXT NOT NULL,
+    created_by_agent TEXT NOT NULL,
+    created_by_profile TEXT,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (question_id, claim_id),
+    FOREIGN KEY (question_id, research_run_id)
+        REFERENCES research_questions(id, research_run_id),
+    FOREIGN KEY (claim_id, research_run_id)
+        REFERENCES claims(id, research_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS question_closure_claims (
+    question_id TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    research_run_id TEXT NOT NULL,
+    claim_status_at_close TEXT NOT NULL
+        CHECK (claim_status_at_close IN ('UNVERIFIED', 'SUPPORTED', 'PARTIALLY_SUPPORTED', 'CONTRADICTED', 'UNRESOLVED')),
+    claim_updated_at_at_close REAL NOT NULL,
+    snapshot_at REAL NOT NULL,
+    PRIMARY KEY (question_id, claim_id),
+    FOREIGN KEY (question_id, research_run_id)
+        REFERENCES research_questions(id, research_run_id),
+    FOREIGN KEY (claim_id, research_run_id)
+        REFERENCES claims(id, research_run_id)
+);
+
+CREATE TABLE IF NOT EXISTS query_graph_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    research_run_id TEXT NOT NULL,
+    graph_id TEXT,
+    question_id TEXT,
+    event_type TEXT NOT NULL CHECK (length(event_type) BETWEEN 1 AND 100),
+    actor_agent TEXT NOT NULL,
+    actor_profile TEXT,
+    reason TEXT CHECK (reason IS NULL OR length(reason) <= 2048),
+    payload_json TEXT NOT NULL DEFAULT '{}' CHECK (length(payload_json) <= 16384),
+    created_at REAL NOT NULL,
+    FOREIGN KEY (research_run_id) REFERENCES research_runs(id),
+    FOREIGN KEY (graph_id, research_run_id)
+        REFERENCES query_graphs(id, research_run_id),
+    FOREIGN KEY (question_id, research_run_id)
+        REFERENCES research_questions(id, research_run_id)
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS ux_evidence_exact_uri_hash
     ON evidence_records(research_run_id, canonical_uri, content_hash)
     WHERE canonical_uri IS NOT NULL;
@@ -505,6 +615,22 @@ CREATE INDEX IF NOT EXISTS idx_claims_run
     ON claims(research_run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_claim_links_run
     ON claim_evidence_links(research_run_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_research_questions_run_fingerprint
+    ON research_questions(research_run_id, normalized_fingerprint);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_question_dependencies_pair
+    ON question_dependencies(dependent_question_id, prerequisite_question_id);
+CREATE INDEX IF NOT EXISTS idx_query_graphs_run
+    ON query_graphs(research_run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_research_questions_graph
+    ON research_questions(graph_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_research_questions_run
+    ON research_questions(research_run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_question_dependencies_run
+    ON question_dependencies(research_run_id, dependent_question_id);
+CREATE INDEX IF NOT EXISTS idx_question_claim_links_run
+    ON question_claim_links(research_run_id, question_id);
+CREATE INDEX IF NOT EXISTS idx_query_graph_events_run
+    ON query_graph_events(research_run_id, created_at, id);
 
 CREATE TRIGGER IF NOT EXISTS research_runs_terminal_status_guard
 BEFORE UPDATE OF status ON research_runs
@@ -554,6 +680,130 @@ BEFORE UPDATE ON claim_evidence_links
 WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
 BEGIN
     SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS query_graphs_open_run_insert_guard
+BEFORE INSERT ON query_graphs
+WHEN NOT EXISTS (
+    SELECT 1 FROM research_runs WHERE id = NEW.research_run_id AND status = 'OPEN'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'research run is not open');
+END;
+CREATE TRIGGER IF NOT EXISTS query_graphs_terminal_update_guard
+BEFORE UPDATE ON query_graphs
+WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS query_graphs_terminal_delete_guard
+BEFORE DELETE ON query_graphs
+WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS research_questions_open_run_insert_guard
+BEFORE INSERT ON research_questions
+WHEN NOT EXISTS (
+    SELECT 1 FROM research_runs WHERE id = NEW.research_run_id AND status = 'OPEN'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'research run is not open');
+END;
+CREATE TRIGGER IF NOT EXISTS research_questions_terminal_update_guard
+BEFORE UPDATE ON research_questions
+WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS research_questions_terminal_delete_guard
+BEFORE DELETE ON research_questions
+WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS question_dependencies_open_run_insert_guard
+BEFORE INSERT ON question_dependencies
+WHEN NOT EXISTS (
+    SELECT 1 FROM research_runs WHERE id = NEW.research_run_id AND status = 'OPEN'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'research run is not open');
+END;
+CREATE TRIGGER IF NOT EXISTS question_dependencies_terminal_update_guard
+BEFORE UPDATE ON question_dependencies
+WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS question_dependencies_terminal_delete_guard
+BEFORE DELETE ON question_dependencies
+WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS question_claim_links_open_run_insert_guard
+BEFORE INSERT ON question_claim_links
+WHEN NOT EXISTS (
+    SELECT 1 FROM research_runs WHERE id = NEW.research_run_id AND status = 'OPEN'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'research run is not open');
+END;
+CREATE TRIGGER IF NOT EXISTS question_claim_links_terminal_update_guard
+BEFORE UPDATE ON question_claim_links
+WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS question_claim_links_terminal_delete_guard
+BEFORE DELETE ON question_claim_links
+WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS question_closure_claims_open_run_insert_guard
+BEFORE INSERT ON question_closure_claims
+WHEN NOT EXISTS (
+    SELECT 1 FROM research_runs WHERE id = NEW.research_run_id AND status = 'OPEN'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'research run is not open');
+END;
+CREATE TRIGGER IF NOT EXISTS question_closure_claims_terminal_update_guard
+BEFORE UPDATE ON question_closure_claims
+WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+CREATE TRIGGER IF NOT EXISTS question_closure_claims_terminal_delete_guard
+BEFORE DELETE ON question_closure_claims
+WHEN EXISTS (SELECT 1 FROM research_runs WHERE id = OLD.research_run_id AND status <> 'OPEN')
+BEGIN
+    SELECT RAISE(ABORT, 'terminal research run is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS query_graph_events_open_run_insert_guard
+BEFORE INSERT ON query_graph_events
+WHEN NOT EXISTS (
+    SELECT 1 FROM research_runs WHERE id = NEW.research_run_id AND status = 'OPEN'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'research run is not open');
+END;
+CREATE TRIGGER IF NOT EXISTS query_graph_events_append_only_update_guard
+BEFORE UPDATE ON query_graph_events
+BEGIN
+    SELECT RAISE(ABORT, 'query graph events are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS query_graph_events_append_only_delete_guard
+BEFORE DELETE ON query_graph_events
+BEGIN
+    SELECT RAISE(ABORT, 'query graph events are append-only');
 END;
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
