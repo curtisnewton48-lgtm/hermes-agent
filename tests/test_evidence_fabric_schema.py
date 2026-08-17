@@ -3,7 +3,7 @@ import sqlite3
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_common import SCHEMA_SQL
+from hermes_state_common import SCHEMA_SQL, SCHEMA_VERSION
 
 
 def _objects(db_path):
@@ -41,7 +41,7 @@ def _insert_evidence(connection, evidence_id, run_id, *, derived_from=None):
     )
 
 
-def test_fresh_schema_has_evidence_fabric_objects_and_v27(tmp_path):
+def test_fresh_schema_has_evidence_fabric_objects_at_current_version(tmp_path):
     db_path = tmp_path / "state.db"
     with SessionDB(db_path):
         pass
@@ -51,7 +51,7 @@ def test_fresh_schema_has_evidence_fabric_objects_and_v27(tmp_path):
     assert {"ux_evidence_exact_uri_hash", "ux_evidence_exact_raw_hash"} <= objects
     with sqlite3.connect(db_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 27
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
@@ -61,6 +61,17 @@ def test_real_pre_v27_database_upgrades_idempotently_without_losing_existing_row
         connection.executescript(SCHEMA_SQL)
         connection.execute("INSERT INTO schema_version VALUES (26)")
         connection.execute("INSERT INTO sessions (id, source, started_at) VALUES ('legacy', 'test', 1)")
+        # Remove later Query Graph objects first so this fixture remains a
+        # pre-v27 Evidence Fabric database even as the current schema advances.
+        for table in (
+            "query_graph_events",
+            "question_closure_claims",
+            "question_claim_links",
+            "question_dependencies",
+            "research_questions",
+            "query_graphs",
+        ):
+            connection.execute(f"DROP TABLE {table}")
         for table in ("claim_evidence_links", "claims", "evidence_records", "research_runs"):
             connection.execute(f"DROP TABLE {table}")
         for name in (
@@ -94,7 +105,7 @@ def test_real_pre_v27_database_upgrades_idempotently_without_losing_existing_row
         assert connection.execute(
             "SELECT id, source, started_at FROM sessions WHERE id = 'legacy'"
         ).fetchone() == ("legacy", "test", 1.0)
-        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == 27
+        assert connection.execute("SELECT version FROM schema_version").fetchone()[0] == SCHEMA_VERSION
         assert connection.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE name = 'research_runs'"
         ).fetchone()[0] == 1
