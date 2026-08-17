@@ -88,9 +88,10 @@ jobs:
           import subprocess
           allowed_prefixes = (
               ".github/workflows/query-graph-focused.yml",
-              "docs/superpowers/execution/query-graph-v1",
+              "docs/superpowers/plans/2026-08-17-query-graph-v1",
               "hermes_state_common.py",
               "research/",
+              "tests/state/test_session_git_metadata_generation.py",
               "tests/test_query_graph",
               "tests/test_evidence_fabric",
               "tests/test_hermes_state",
