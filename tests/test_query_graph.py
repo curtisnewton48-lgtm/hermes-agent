@@ -6,7 +6,12 @@ from datetime import datetime, timezone
 import pytest
 
 from hermes_state import SessionDB
-from research.evidence_fabric import ClaimStatus, EvidenceScope
+from research.evidence_fabric import (
+    ClaimStatus,
+    EvidenceFabricService,
+    EvidenceScope,
+    ResearchRunStatus,
+)
 from research.query_graph import (
     ClosureClaimSnapshot,
     CompletionAssessment,
@@ -16,6 +21,7 @@ from research.query_graph import (
     GraphWorkflowState,
     QueryGraph,
     QueryGraphEvent,
+    QueryGraphLifecycleError,
     QueryGraphScopeError,
     QueryGraphService,
     QueryGraphValidationError,
@@ -38,6 +44,12 @@ def _service(tmp_path, *, scope_key="scope-a", agent_id="agent-a"):
     db = SessionDB(tmp_path / "state.db")
     scope = EvidenceScope(scope_key, "profile-a", "connection-a", agent_id)
     return db, QueryGraphService(db, scope)
+
+
+def _services(tmp_path, *, scope_key="scope-a", agent_id="agent-a"):
+    db = SessionDB(tmp_path / "state.db")
+    scope = EvidenceScope(scope_key, "profile-a", "connection-a", agent_id)
+    return db, EvidenceFabricService(db, scope), QueryGraphService(db, scope)
 
 
 def _seed_read_rows(db: SessionDB) -> None:
@@ -234,8 +246,6 @@ def test_foreign_scope_cannot_read_graph_question_or_events(tmp_path):
 
 
 def test_public_dataclass_contracts_are_constructible_and_frozen():
-    # These types are consumed by later tasks; this test catches accidental
-    # renames or mutability before write-path behavior is implemented.
     service_time = datetime.fromtimestamp(1, timezone.utc)
     question = ResearchQuestion(
         id="q",
@@ -268,3 +278,169 @@ def test_public_dataclass_contracts_are_constructible_and_frozen():
         "q", QuestionResolution.UNANSWERED, False, ()
     ).resolution is QuestionResolution.UNANSWERED
     assert CompletionAssessment(False, ("not ready",)).ready is False
+
+
+def test_create_graph_defaults_optional_and_audits_runtime_provenance(tmp_path):
+    db, evidence, service = _services(tmp_path, agent_id="director")
+    try:
+        run = evidence.create_research_run("Investigate policy")
+        graph = service.create_graph(
+            run.id,
+            name="Legal",
+            purpose="Resolve legal validity",
+            reason=GraphCreationReason.NEW_DOMAIN,
+        )
+
+        assert graph.research_run_id == run.id
+        assert graph.name == "Legal"
+        assert graph.purpose == "Resolve legal validity"
+        assert graph.role is GraphRole.OPTIONAL
+        assert graph.workflow_state is GraphWorkflowState.OPEN
+        assert graph.created_by_agent == "director"
+        assert graph.created_by_profile == "profile-a"
+
+        events = service.list_events(run.id, graph_id=graph.id)
+        assert len(events) == 1
+        assert events[0].event_type == "GRAPH_CREATED"
+        assert events[0].actor_agent == "director"
+        assert events[0].actor_profile == "profile-a"
+        assert events[0].reason == GraphCreationReason.NEW_DOMAIN.value
+        assert events[0].payload == {
+            "name": "Legal",
+            "purpose": "Resolve legal validity",
+            "role": GraphRole.OPTIONAL.value,
+        }
+    finally:
+        db.close()
+
+
+def test_create_graph_accepts_explicit_required_and_validates_fields(tmp_path):
+    db, evidence, service = _services(tmp_path)
+    try:
+        run = evidence.create_research_run("Objective")
+        graph = service.create_graph(
+            run.id,
+            name="Technical",
+            purpose="Assess feasibility",
+            role=GraphRole.REQUIRED,
+        )
+        assert graph.role is GraphRole.REQUIRED
+
+        for name, purpose, message in (
+            ("", "purpose", "graph name is required"),
+            ("   ", "purpose", "graph name is required"),
+            ("name", "", "graph purpose is required"),
+            ("name", "   ", "graph purpose is required"),
+        ):
+            with pytest.raises(QueryGraphValidationError, match=message):
+                service.create_graph(run.id, name=name, purpose=purpose)
+    finally:
+        db.close()
+
+
+def test_create_graph_enforces_scope_and_terminal_run_lifecycle(tmp_path):
+    db, evidence, service = _services(tmp_path)
+    other = QueryGraphService(
+        db, EvidenceScope("scope-b", "profile-b", "connection-b", "other")
+    )
+    try:
+        run = evidence.create_research_run("Objective")
+        with pytest.raises(QueryGraphScopeError):
+            other.create_graph(run.id, name="Foreign", purpose="Should fail")
+
+        evidence.transition_research_run(run.id, ResearchRunStatus.COMPLETED)
+        with pytest.raises(QueryGraphLifecycleError, match="terminal research run"):
+            service.create_graph(run.id, name="Late", purpose="Should fail")
+    finally:
+        db.close()
+
+
+def test_create_graph_rolls_back_state_when_event_append_fails(tmp_path, monkeypatch):
+    db, evidence, service = _services(tmp_path)
+    try:
+        run = evidence.create_research_run("Objective")
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("event write failed")
+
+        monkeypatch.setattr(service, "_append_event", explode, raising=False)
+        with pytest.raises(RuntimeError, match="event write failed"):
+            service.create_graph(run.id, name="Legal", purpose="Atomicity proof")
+
+        assert service.list_graphs(run.id) == ()
+        assert service.list_events(run.id) == ()
+    finally:
+        db.close()
+
+
+def test_set_graph_role_requires_reason_audits_and_rejects_noop(tmp_path):
+    db, evidence, service = _services(tmp_path, agent_id="director")
+    try:
+        run = evidence.create_research_run("Objective")
+        graph = service.create_graph(run.id, name="Legal", purpose="Scope")
+
+        with pytest.raises(QueryGraphValidationError, match="reason is required"):
+            service.set_graph_role(graph.id, GraphRole.REQUIRED, reason="   ")
+
+        changed = service.set_graph_role(
+            graph.id,
+            GraphRole.REQUIRED,
+            reason="required for final answer",
+        )
+        assert changed.role is GraphRole.REQUIRED
+        events = service.list_events(run.id, graph_id=graph.id)
+        assert [event.event_type for event in events] == [
+            "GRAPH_CREATED",
+            "GRAPH_ROLE_CHANGED",
+        ]
+        assert events[-1].reason == "required for final answer"
+        assert events[-1].actor_agent == "director"
+        assert events[-1].payload == {
+            "old_role": GraphRole.OPTIONAL.value,
+            "new_role": GraphRole.REQUIRED.value,
+        }
+
+        with pytest.raises(QueryGraphLifecycleError, match="role is already"):
+            service.set_graph_role(
+                graph.id,
+                GraphRole.REQUIRED,
+                reason="duplicate request",
+            )
+    finally:
+        db.close()
+
+
+def test_set_graph_role_rejects_closed_graph_and_terminal_run(tmp_path):
+    db, evidence, service = _services(tmp_path)
+    try:
+        run = evidence.create_research_run("Objective")
+        graph = service.create_graph(run.id, name="Legal", purpose="Scope")
+
+        with db._lock:
+            db._conn.execute(
+                "UPDATE query_graphs SET workflow_state='CLOSED', closed_at=10 "
+                "WHERE id=?",
+                (graph.id,),
+            )
+        with pytest.raises(QueryGraphLifecycleError, match="closed query graph"):
+            service.set_graph_role(
+                graph.id,
+                GraphRole.REQUIRED,
+                reason="too late",
+            )
+
+        with db._lock:
+            db._conn.execute(
+                "UPDATE query_graphs SET workflow_state='OPEN', closed_at=NULL "
+                "WHERE id=?",
+                (graph.id,),
+            )
+        evidence.transition_research_run(run.id, ResearchRunStatus.CANCELLED)
+        with pytest.raises(QueryGraphLifecycleError, match="terminal research run"):
+            service.set_graph_role(
+                graph.id,
+                GraphRole.REQUIRED,
+                reason="run ended",
+            )
+    finally:
+        db.close()
